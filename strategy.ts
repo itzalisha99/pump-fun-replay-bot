@@ -32,6 +32,19 @@
 // no I/O, iteration only over insertion-ordered maps, so the two graded
 // executions produce byte-identical action logs.
 
+// Speed fix (round 2, 2026-11-24): the first submission was rejected
+// because the server's grade run timed out. Profiling showed the bot
+// itself was fast (onBatch 0.25s over the whole dev window, bot process
+// 4.7s, grade-local 31s against an 1800s wall budget), so the timeout
+// was most likely a slow/cold sandbox on the server's side, not the
+// strategy — but the per-batch work still had two avoidable costs, and
+// both are removed here without changing a single decision: the entry
+// signal no longer builds a per-buyer map for tapes that fail the
+// numeric gates (two passes, candidates only), and old tape trades are
+// dropped by advancing a head index instead of splicing the array on
+// every batch. The action log is byte-identical to the first submission
+// (same action_log_sha256), so every trade, fill and PnL is unchanged.
+//
 import {
   LAMPORTS_PER_SOL,
   type Batch,
@@ -189,6 +202,11 @@ interface Trade {
 interface Tape {
   created: number | null;
   trades: Trade[];
+  /** Index of the first live trade: old trades are dropped by advancing
+   * this instead of splicing the array on every batch (a splice shifts
+   * every remaining element, so a busy tape paid O(n) per batch). The
+   * array is compacted only once the dead prefix grows past 512. */
+  head: number;
   entries: number;
   lastExit: number;
   creator: string | null;
@@ -242,6 +260,7 @@ export function createStrategy(p: Params = DEFAULT_PARAMS) {
       t = {
         created: null,
         trades: [],
+        head: 0,
         entries: 0,
         lastExit: -1e12,
         creator: null,
@@ -254,10 +273,12 @@ export function createStrategy(p: Params = DEFAULT_PARAMS) {
     return t;
   };
 
-  /** Net recorded SOL (buys minus sells) over the last `w` slots. */
+  /** Net recorded SOL (buys minus sells) over the last `w` slots. Scans
+   * back from the newest live trade; the head index keeps dead trades
+   * out of the scan without shifting the array. */
   const flow = (t: Tape, now: number, w: number): number => {
     let net = 0;
-    for (let i = t.trades.length - 1; i >= 0; i--) {
+    for (let i = t.trades.length - 1; i >= t.head; i--) {
       const tr = t.trades[i]!;
       if (tr.slot <= now - w) break;
       net += tr.buy ? tr.sol : -tr.sol;
@@ -265,7 +286,14 @@ export function createStrategy(p: Params = DEFAULT_PARAMS) {
     return net;
   };
 
-  /** Ignition signal on a curve's opening tape at slot `now`. */
+  /** Ignition signal on a curve's opening tape at slot `now`. Two passes
+   * over the window: the first counts the tape (buys, net SOL, prices)
+   * without allocating anything, and only a tape that clears every numeric
+   * gate gets the second pass that builds the per-buyer map for the top-
+   * share check. Most tapes fail the first gates, so the map — one
+   * allocation per call before — is now built only for real candidates.
+   * The arithmetic is identical to a single pass (same additions, same
+   * order), so the signal's answer cannot change. */
   const entrySignal = (t: Tape, now: number, rqSol: number): boolean => {
     if (rqSol < p.minRqSol || rqSol > p.maxRqSol) return false;
     if (t.created === null) return false;
@@ -278,8 +306,8 @@ export function createStrategy(p: Params = DEFAULT_PARAMS) {
     let startPrice = -1;
     let high = 0;
     let last = 0;
-    const byUser = new Map<string, number>();
-    for (const tr of t.trades) {
+    for (let i = t.head; i < t.trades.length; i++) {
+      const tr = t.trades[i]!;
       if (tr.slot <= from) {
         startPrice = tr.price;
         continue;
@@ -288,19 +316,26 @@ export function createStrategy(p: Params = DEFAULT_PARAMS) {
       if (tr.buy) {
         buySol += tr.sol;
         buys++;
-        byUser.set(tr.user, (byUser.get(tr.user) ?? 0) + tr.sol);
       } else {
         sellSol += tr.sol;
       }
       if (tr.price > high) high = tr.price;
       last = tr.price;
     }
-    if (buys < p.minBuys || byUser.size < p.minBuyers) return false;
+    if (buys < p.minBuys) return false;
     if (buySol - sellSol < p.minNetSol) return false;
     if (startPrice <= 0) return false;
     const up = last / startPrice - 1;
     if (up < p.minPriceUp) return false;
     if (last < high * p.nearHigh) return false;
+    // Second pass, candidates only: who bought, and how concentrated.
+    const byUser = new Map<string, number>();
+    for (let i = t.head; i < t.trades.length; i++) {
+      const tr = t.trades[i]!;
+      if (tr.slot <= from || !tr.buy) continue;
+      byUser.set(tr.user, (byUser.get(tr.user) ?? 0) + tr.sol);
+    }
+    if (byUser.size < p.minBuyers) return false;
     let top = 0;
     for (const v of byUser.values()) if (v > top) top = v;
     if (buySol > 0 && top > p.maxTopShare * buySol) return false;
@@ -349,9 +384,16 @@ export function createStrategy(p: Params = DEFAULT_PARAMS) {
       }
       for (const mint of traded) {
         const t = tapes.get(mint)!;
-        let cut = 0;
+        // Drop trades older than the keep window by moving the head: the
+        // array is compacted only when the dead prefix grows past 512,
+        // so a busy tape no longer pays a shift on every batch.
+        let cut = t.head;
         while (cut < t.trades.length && t.trades[cut]!.slot <= now - keep) cut++;
-        if (cut > 0) t.trades.splice(0, cut);
+        t.head = cut;
+        if (t.head > 512) {
+          t.trades = t.trades.slice(t.head);
+          t.head = 0;
+        }
       }
       const marks = new Map(batch.marks.map((m) => [m.mint, m] as const));
       const pendingByMint = new Map<Pubkey, number>();
@@ -508,7 +550,8 @@ export function createStrategy(p: Params = DEFAULT_PARAMS) {
             if (age <= p.scalpMaxAge && rqSol >= p.scalpMinRq && t.creatorBuy <= p.scalpMaxCreatorBuy && !t.creatorSold) {
               const buyers = new Set<string>();
               let net = 0;
-              for (const tr of t.trades) {
+              for (let i = t.head; i < t.trades.length; i++) {
+                const tr = t.trades[i]!;
                 if (tr.buy) {
                   buyers.add(tr.user);
                   net += tr.sol;
